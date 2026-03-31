@@ -459,15 +459,15 @@ async def lookup_servlet(issuer: str, document: str, entity_type: str) -> dict:
                     return _not_found(data.get("msg") or "CNPJ não encontrado no portal.")
                 if sucesso in ("s", "true") or data.get("unidades"):
                     return _found(_parse_servlet_units(data.get("unidades") or [data]))
-
-        if not body:
-            return _found([])
+                # Dict sem indicador de sucesso reconhecido (ex: {} ou {"usuario":"S"})
+                # Não há evidência de cadastro — tratar como não encontrado
+                return _not_found("CNPJ não encontrado no portal.")
 
         error_keywords = ["erro", "inválid", "incorret", "não encontrad", "nao encontrad"]
         if any(k in body.lower() for k in error_keywords):
             return _not_found("CNPJ não encontrado no portal.")
 
-        return _found([])
+        return _not_found("CNPJ não encontrado no portal.")
 
 
 def _parse_servlet_units(items: list) -> list[dict]:
