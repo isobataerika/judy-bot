@@ -6,3 +6,4 @@ slack-bolt==1.21.3
 slack-sdk==3.33.5
 aiohttp==3.10.5
 python-dotenv==1.0.1
+openpyxl==3.1.2

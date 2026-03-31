@@ -8,7 +8,11 @@ import json
 import os
 import re
 import asyncio
+import time
+from io import BytesIO
 from typing import Literal
+
+import openpyxl
 
 import httpx
 from dotenv import load_dotenv
@@ -35,7 +39,7 @@ slack_handler = AsyncSlackRequestHandler(slack_app)
 
 app = FastAPI(
     title="Traceability Agent — Operator Lookup",
-    version="1.2.0",
+    version="1.3.0",
     description="Lookup de cadastro ativo de operadores nos portais MTR + Judy Slack Bot.",
 )
 
@@ -52,6 +56,8 @@ ENTITY_TYPE_CODE = {
 ISSUER_LABELS = {
     "brasilapi_cnpj": "Cartão CNPJ (Receita Federal)",
     "rntrc": "RNTRC (ANTT)",
+    "cetesb_lo": "CETESB — Licença de Operação / Dispensa (e-CETESB)",
+    "spregula": "SP Regula — Operadores Municipais (Prefeitura SP)",
     "sigor_sp": "CETESB — São Paulo",
     "sinir": "IBAMA — Nacional",
     "inea_rj": "Instituto Estadual do Ambiente — Rio de Janeiro",
@@ -63,7 +69,7 @@ ISSUER_LABELS = {
 }
 
 SUPPORTED_ISSUERS = {
-    "brasilapi_cnpj", "rntrc",
+    "brasilapi_cnpj", "rntrc", "cetesb_lo", "spregula",
     "sigor_sp", "sinir", "inea_rj", "semad_go", "semad_mg", "fepam_rs", "iema_es",
 }
 NOT_SUPPORTED_ISSUERS = {
@@ -484,6 +490,259 @@ def _parse_servlet_units(items: list) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Lookup — CETESB Licença de Operação / Dispensa (e-CETESB)
+# ---------------------------------------------------------------------------
+# Endpoint público: GET https://e.cetesb.sp.gov.br/portal-servicos-backend/v1/public/requisitions/
+# Sem autenticação. Filtra por CNPJ (14 dígitos, sem máscara).
+# Retorna processos de licenciamento ambiental (LO, CDL, VRA, DAIL etc.)
+# ---------------------------------------------------------------------------
+
+CETESB_LO_API = "https://e.cetesb.sp.gov.br/portal-servicos-backend/v1/public/requisitions/"
+
+CETESB_LO_KEYWORDS = [
+    "licença de operação", "renovação de licença de operação",
+    "dispensa", "certificado de dispensa",
+    "via rápida ambiental", "vra",
+    "declaração de atividade isenta", "dail",
+]
+
+CETESB_ACTIVE_STATUSES = {"emitido", "em análise", "aguardando pagamento", "aguardando documentos"}
+
+
+async def lookup_cetesb_lo(document: str, entity_type: str) -> dict:
+    async with httpx.AsyncClient(verify=False, timeout=HTTPX_TIMEOUT) as client:
+        try:
+            resp = await client.get(
+                CETESB_LO_API,
+                params={"cnpj": document, "page": 0, "size": 100},
+            )
+        except httpx.TimeoutException:
+            return _error("TIMEOUT", "e-CETESB não respondeu em 20 segundos.")
+        except httpx.RequestError as exc:
+            return _error("CONNECTION_ERROR", f"Erro de conexão com e-CETESB: {exc}")
+
+        if resp.status_code != 200:
+            return _error(f"HTTP_{resp.status_code}", f"e-CETESB retornou HTTP {resp.status_code}.")
+
+        try:
+            data = resp.json()
+        except Exception:
+            return _error("PARSE_ERROR", "Resposta do e-CETESB não é JSON válido.")
+
+        content = data.get("content") or []
+        if not content:
+            return _not_found(
+                "Nenhum processo encontrado no e-CETESB para este CNPJ. "
+                "Nota: o campo CNPJ nem sempre está preenchido nos registros — "
+                "tente buscar pelo nome da empresa em e.cetesb.sp.gov.br."
+            )
+
+        # Filtrar por processos relevantes (LO, Dispensa, VRA, DAIL)
+        relevant = [
+            r for r in content
+            if any(kw in (r.get("object") or "").lower() for kw in CETESB_LO_KEYWORDS)
+        ]
+        if not relevant:
+            relevant = content  # retorna tudo se nenhum for LO específico
+
+        has_active = any(
+            (r.get("status") or "").lower() in CETESB_ACTIVE_STATUSES
+            for r in relevant
+        )
+
+        units = []
+        for r in relevant:
+            units.append({
+                "unit_id": str(r.get("requisitionNumber") or r.get("id") or ""),
+                "name": r.get("empreendimentoNome") or r.get("stakeholder") or "",
+                "status": r.get("status") or "",
+                "object": r.get("object") or "",
+                "submitted_at": r.get("submittedAt") or "",
+                "num_e_ambiente": r.get("numEAmbiente") or "",
+            })
+
+        if has_active:
+            return _found(units)
+        return {
+            "registered": False,
+            "units": units,
+            "code": "INACTIVE",
+            "message": "Processos encontrados no e-CETESB mas nenhum com status ativo/emitido.",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Lookup — SP Regula (Prefeitura de São Paulo)
+# ---------------------------------------------------------------------------
+# Dados publicados como XLSX na página da Prefeitura SP (sem API).
+# 4 arquivos: RCC Transportadores, RCC Destinos Finais,
+#             RGG Transportadores, RGG Destinos Finais.
+# URLs dos arquivos mudam mensalmente (data no slug) — busca os links atuais
+# antes de baixar. Cache em memória por 24h.
+# ---------------------------------------------------------------------------
+
+SPREGULA_PAGE_URL = "https://prefeitura.sp.gov.br/web/spregula/w/residuos_solidos/311649"
+SPREGULA_BASE_URL = "https://prefeitura.sp.gov.br"
+SPREGULA_CACHE_TTL = 86400  # 24 horas
+
+SPREGULA_CATEGORY_LABELS = {
+    "rcc_transportador": "Transportador RCC",
+    "rcc_destino":       "Destino Final RCC",
+    "rgg_transportador": "Transportador RGG",
+    "rgg_destino":       "Destino Final RGG",
+}
+
+_spregula_data: dict[str, list[dict]] | None = None
+_spregula_loaded_at: float = 0.0
+
+
+def _categorize_spregula_url(url: str) -> str | None:
+    u = url.lower()
+    if "transportadores-rcc" in u or "transportador-rcc" in u:
+        return "rcc_transportador"
+    if "destinos-finais-de-rcc" in u or "destino-final-rcc" in u or "destinos-finais-rcc" in u:
+        return "rcc_destino"
+    if "transportadores-rgg" in u or "transportador-rgg" in u:
+        return "rgg_transportador"
+    if "destinos-finais-rgg" in u or "destino-final-rgg" in u or "destinos-rgg" in u:
+        return "rgg_destino"
+    return None
+
+
+def _parse_spregula_xlsx(content: bytes, category: str) -> dict[str, list[dict]]:
+    """Parseia um XLSX do SP Regula e retorna dict indexado por CNPJ (14 dígitos)."""
+    result: dict[str, list[dict]] = {}
+    try:
+        wb = openpyxl.load_workbook(BytesIO(content), read_only=True, data_only=True)
+        sheet = wb.active
+        rows = list(sheet.iter_rows(values_only=True))
+        wb.close()
+    except Exception:
+        return result
+
+    if not rows:
+        return result
+
+    # Localizar linha de cabeçalho (primeira linha que tem "cnpj" em alguma célula)
+    header_idx, cnpj_col = None, None
+    for i, row in enumerate(rows[:10]):
+        for j, cell in enumerate(row):
+            if cell and "cnpj" in str(cell).lower():
+                header_idx, cnpj_col = i, j
+                break
+        if header_idx is not None:
+            break
+
+    if header_idx is None or cnpj_col is None:
+        return result
+
+    headers = [str(h).strip() if h else f"col_{j}" for j, h in enumerate(rows[header_idx])]
+
+    for row in rows[header_idx + 1:]:
+        if not row or cnpj_col >= len(row) or not row[cnpj_col]:
+            continue
+        cnpj_digits = re.sub(r"\D", "", str(row[cnpj_col]))
+        if len(cnpj_digits) != 14:
+            continue
+
+        record = {"category": category}
+        for j, header in enumerate(headers):
+            if j < len(row) and row[j] is not None:
+                record[header] = str(row[j]).strip()
+
+        result.setdefault(cnpj_digits, []).append(record)
+
+    return result
+
+
+async def _load_spregula_cache(client: httpx.AsyncClient) -> None:
+    """Baixa os 4 XLSXs do SP Regula e indexa por CNPJ."""
+    global _spregula_data, _spregula_loaded_at
+
+    if _spregula_data is not None and (time.time() - _spregula_loaded_at) < SPREGULA_CACHE_TTL:
+        return
+
+    # 1. Busca os links atuais na página
+    try:
+        resp = await client.get(SPREGULA_PAGE_URL, follow_redirects=True, timeout=30.0)
+        raw_links = re.findall(r"/documents/d/spregula/[^\s\"'<>]+", resp.text)
+    except Exception:
+        return
+
+    file_map: dict[str, str] = {}
+    for link in raw_links:
+        cat = _categorize_spregula_url(link)
+        if cat and cat not in file_map:
+            file_map[cat] = SPREGULA_BASE_URL + link
+
+    if not file_map:
+        return
+
+    # 2. Baixa e parseia cada arquivo
+    merged: dict[str, list[dict]] = {}
+    for category, url in file_map.items():
+        try:
+            r = await client.get(url, follow_redirects=True, timeout=45.0)
+            if r.status_code != 200:
+                continue
+            for cnpj, records in _parse_spregula_xlsx(r.content, category).items():
+                merged.setdefault(cnpj, []).extend(records)
+        except Exception:
+            continue
+
+    if merged:
+        _spregula_data = merged
+        _spregula_loaded_at = time.time()
+
+
+async def lookup_spregula(document: str, entity_type: str) -> dict:
+    async with httpx.AsyncClient(verify=False, timeout=50.0, follow_redirects=True) as client:
+        await _load_spregula_cache(client)
+
+    if _spregula_data is None:
+        return _error("CONFIG_ERROR", "Não foi possível carregar os dados do SP Regula.")
+
+    records = _spregula_data.get(document, [])
+    if not records:
+        return _not_found("CNPJ não encontrado nas listas de operadores do SP Regula.")
+
+    units = []
+    has_active = False
+    for rec in records:
+        category = rec.get("category", "")
+        cat_label = SPREGULA_CATEGORY_LABELS.get(category, category)
+        name = (
+            rec.get("Razao Social") or rec.get("Razão Social") or
+            rec.get("NOME FANTASIA") or rec.get("DESTINO FINAL") or ""
+        )
+        validade = rec.get("VALIDADE") or rec.get("Validade") or ""
+        codigo = rec.get("Número Cadastro") or rec.get("CÓDIGO CADASTRO") or rec.get("Código Cadastro") or ""
+        status = rec.get("Status") or rec.get("STATUS") or "Ativo"
+        modalidades = rec.get("Modalidades") or rec.get("MODALIDADES") or ""
+
+        if status.strip().lower() in ("ativo", "active", ""):
+            has_active = True
+
+        units.append({
+            "unit_id": codigo,
+            "name": name,
+            "category": cat_label,
+            "status": status,
+            "validade": validade,
+            "modalidades": modalidades,
+        })
+
+    if has_active:
+        return _found(units)
+    return {
+        "registered": False,
+        "units": units,
+        "code": "INACTIVE",
+        "message": "Empresa encontrada no SP Regula mas com status inativo.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Portais não suportados
 # ---------------------------------------------------------------------------
 
@@ -519,6 +778,10 @@ async def run_lookup(issuer: str, document: str, entity_type: str) -> dict:
         return await lookup_brasilapi_cnpj(document, entity_type)
     if issuer == "rntrc":
         return await lookup_rntrc(document, entity_type)
+    if issuer == "cetesb_lo":
+        return await lookup_cetesb_lo(document, entity_type)
+    if issuer == "spregula":
+        return await lookup_spregula(document, entity_type)
     if issuer == "sigor_sp":
         return await lookup_sigor_sp(document, entity_type)
     if issuer == "sinir":
@@ -537,7 +800,7 @@ async def run_lookup_all_issuers(document: str, entity_types: list[str]) -> dict
     all_issuers = list(ISSUER_LABELS.keys())
 
     # Portais independentes de entity_type (consulta uma única vez)
-    entity_independent = {"brasilapi_cnpj", "rntrc"}
+    entity_independent = {"brasilapi_cnpj", "rntrc", "cetesb_lo", "spregula"}
 
     async def lookup_for_type(issuer: str, entity_type: str) -> tuple[str, str, dict]:
         result = await run_lookup(issuer, document, entity_type)
@@ -680,6 +943,65 @@ def _format_rntrc_line(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_cetesb_lo_line(result: dict) -> str:
+    """Formata resultado do e-CETESB com tipo de processo e status."""
+    registered = result.get("registered")
+    icon = ISSUER_ICONS.get(registered, "⚠️")
+    label = ISSUER_LABELS["cetesb_lo"]
+    units = result.get("units") or []
+
+    if registered is None:
+        return f"{icon} *{label}* — {result.get('message', 'erro na consulta')}"
+    if not units:
+        return f"{icon} *{label}* — {result.get('message', 'não encontrado')}"
+
+    # Agrupar por status para resumo
+    emitidos = [u for u in units if (u.get("status") or "").lower() == "emitido"]
+    pendentes = [u for u in units if (u.get("status") or "").lower() in ("em análise", "aguardando pagamento", "aguardando documentos")]
+
+    lines = [f"{icon} *{label}*"]
+    if emitidos:
+        u = emitidos[0]
+        lines.append(f"   ✔ {u.get('object', '')} — *{u.get('status', '')}*")
+        if u.get("num_e_ambiente"):
+            lines.append(f"   Nº e-Ambiente: {u['num_e_ambiente']}")
+        if len(emitidos) > 1:
+            lines.append(f"   (+{len(emitidos)-1} processo(s) emitido(s))")
+    if pendentes:
+        lines.append(f"   ⏳ {len(pendentes)} processo(s) em andamento")
+    if not emitidos and not pendentes and units:
+        u = units[0]
+        lines.append(f"   {u.get('object', '')} — {u.get('status', '')}")
+
+    return "\n".join(lines)
+
+
+def _format_spregula_line(result: dict) -> str:
+    """Formata resultado do SP Regula com categorias e validade."""
+    registered = result.get("registered")
+    icon = ISSUER_ICONS.get(registered, "⚠️")
+    label = ISSUER_LABELS["spregula"]
+    units = result.get("units") or []
+
+    if registered is None:
+        return f"{icon} *{label}* — {result.get('message', 'erro na consulta')}"
+    if not units:
+        return f"{icon} *{label}* — {result.get('message', 'não encontrado')}"
+
+    lines = [f"{icon} *{label}*"]
+    for u in units:
+        cat = u.get("category", "")
+        validade = u.get("validade", "")
+        codigo = u.get("unit_id", "")
+        status = u.get("status", "")
+        modalidades = u.get("modalidades", "")
+        detail_parts = [p for p in [cat, f"Cód. {codigo}" if codigo else "", f"Validade: {validade}" if validade else "", status] if p]
+        lines.append(f"   • {' | '.join(detail_parts)}")
+        if modalidades:
+            lines.append(f"     Modalidades: {modalidades}")
+    return "\n".join(lines)
+
+
 def _build_slack_block(document: str, entity_types: list[str], results: dict) -> list[dict]:
     """Monta os blocos Slack para um CNPJ."""
     tipo_label = " + ".join(ENTITY_TYPE_LABELS.get(t, t) for t in entity_types)
@@ -695,6 +1017,10 @@ def _build_slack_block(document: str, entity_types: list[str], results: dict) ->
             lines.append(_format_brasilapi_line(result))
         elif issuer == "rntrc":
             lines.append(_format_rntrc_line(result))
+        elif issuer == "cetesb_lo":
+            lines.append(_format_cetesb_lo_line(result))
+        elif issuer == "spregula":
+            lines.append(_format_spregula_line(result))
         else:
             icon = ISSUER_ICONS.get(registered, "⚠️")
             if registered is True:
@@ -811,4 +1137,4 @@ async def lookup_operator_multi(req: MultiLookupRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.2.0"}
+    return {"status": "ok", "version": "1.3.0"}
