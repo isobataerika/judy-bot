@@ -13,20 +13,20 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, field_validator
-from slack_bolt import App
-from slack_bolt.adapter.fastapi import SlackRequestHandler
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Slack App
+# Slack App (async — compatível com FastAPI/uvicorn)
 # ---------------------------------------------------------------------------
 
-slack_app = App(
+slack_app = AsyncApp(
     token=os.environ["SLACK_BOT_TOKEN"],
     signing_secret=os.environ["SLACK_SIGNING_SECRET"],
 )
-slack_handler = SlackRequestHandler(slack_app)
+slack_handler = AsyncSlackRequestHandler(slack_app)
 
 # ---------------------------------------------------------------------------
 # FastAPI App
@@ -456,7 +456,7 @@ def _build_slack_block(document: str, entity_types: list[str], results: dict) ->
 
 
 @slack_app.event("app_mention")
-def handle_mention(event, say, logger):
+async def handle_mention(event, say, logger):
     text = event.get("text", "")
     thread_ts = event.get("thread_ts") or event.get("ts")
     channel = event["channel"]
@@ -465,7 +465,7 @@ def handle_mention(event, say, logger):
     cnpjs = [c for c in cnpjs if len(c) == 14]
 
     if not cnpjs:
-        say(
+        await say(
             text="Não encontrei nenhum CNPJ na mensagem. Tente: `@judy 12.345.678/0001-90`",
             channel=channel,
             thread_ts=thread_ts,
@@ -476,27 +476,20 @@ def handle_mention(event, say, logger):
 
     # Confirmação imediata (Slack exige resposta em 3s)
     tipo_label = " + ".join(ENTITY_TYPE_LABELS.get(t, t) for t in entity_types)
-    say(
+    await say(
         text=f"🔍 Verificando {len(cnpjs)} CNPJ(s) como _{tipo_label}_ em todos os portais...",
         channel=channel,
         thread_ts=thread_ts,
     )
 
-    # Consulta todos os portais (roda em loop síncrono pois o Bolt é síncrono por padrão)
-    loop = asyncio.new_event_loop()
-    try:
-        for cnpj in cnpjs:
-            try:
-                results = loop.run_until_complete(
-                    run_lookup_all_issuers(cnpj, entity_types)
-                )
-                blocks = _build_slack_block(cnpj, entity_types, results)
-                say(blocks=blocks, text=f"Resultado para {fmt_cnpj(cnpj)}", channel=channel, thread_ts=thread_ts)
-            except Exception as exc:
-                logger.error(f"Erro ao consultar CNPJ {cnpj}: {exc}")
-                say(text=f"⚠️ Erro ao consultar CNPJ `{fmt_cnpj(cnpj)}`: {exc}", channel=channel, thread_ts=thread_ts)
-    finally:
-        loop.close()
+    for cnpj in cnpjs:
+        try:
+            results = await run_lookup_all_issuers(cnpj, entity_types)
+            blocks = _build_slack_block(cnpj, entity_types, results)
+            await say(blocks=blocks, text=f"Resultado para {fmt_cnpj(cnpj)}", channel=channel, thread_ts=thread_ts)
+        except Exception as exc:
+            logger.error(f"Erro ao consultar CNPJ {cnpj}: {exc}")
+            await say(text=f"⚠️ Erro ao consultar CNPJ `{fmt_cnpj(cnpj)}`: {exc}", channel=channel, thread_ts=thread_ts)
 
 
 # ---------------------------------------------------------------------------
