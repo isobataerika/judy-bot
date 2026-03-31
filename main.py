@@ -415,7 +415,8 @@ async def lookup_sinir(document: str, entity_type: str) -> dict:
 SERVLET_PORTALS = {
     "inea_rj":  {"url": "https://mtr.inea.rj.gov.br/ControllerServlet",             "cnpj_mask": True},
     "semad_go": {"url": "https://mtr.meioambiente.go.gov.br/ControllerServlet",      "cnpj_mask": False},
-    "semad_mg": {"url": "https://mtr.meioambiente.mg.gov.br/ControllerServlet",      "cnpj_mask": True},
+    "semad_mg": {"url": "https://mtr.meioambiente.mg.gov.br/ControllerServlet",      "cnpj_mask": True,
+                 "found_dict_key": "usuario", "found_dict_val": "S"},  # resposta própria do portal
     "fepam_rs": {"url": "https://mtr.fepam.rs.gov.br/ControllerServlet",             "cnpj_mask": True},
     "iema_es":  {"url": "https://mtr.iema.es.gov.br/ControllerServlet",              "cnpj_mask": False},
 }
@@ -465,8 +466,12 @@ async def lookup_servlet(issuer: str, document: str, entity_type: str) -> dict:
                     return _not_found(data.get("msg") or "CNPJ não encontrado no portal.")
                 if sucesso in ("s", "true") or data.get("unidades"):
                     return _found(_parse_servlet_units(data.get("unidades") or [data]))
-                # Dict sem indicador de sucesso reconhecido (ex: {} ou {"usuario":"S"})
-                # Não há evidência de cadastro — tratar como não encontrado
+                # Verifica padrão de "encontrado" específico do portal (ex: SEMAD-MG usa {"usuario":"S"})
+                found_key = config.get("found_dict_key")
+                found_val = config.get("found_dict_val")
+                if found_key and str(data.get(found_key, "")) == str(found_val):
+                    return _found([])
+                # Dict sem indicador reconhecido (ex: {}) → não encontrado
                 return _not_found("CNPJ não encontrado no portal.")
 
         error_keywords = ["erro", "inválid", "incorret", "não encontrad", "nao encontrad"]
