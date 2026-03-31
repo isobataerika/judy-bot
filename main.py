@@ -52,14 +52,14 @@ ENTITY_TYPE_CODE = {
 ISSUER_LABELS = {
     "brasilapi_cnpj": "Cartão CNPJ (Receita Federal)",
     "rntrc": "RNTRC (ANTT)",
-    "sigor_sp": "SIGOR-SP (CETESB)",
-    "sinir": "SINIR (IBAMA Federal)",
-    "inea_rj": "INEA-RJ",
-    "semad_go": "SEMAD-GO",
-    "semad_mg": "SEMAD-MG",
-    "fepam_rs": "FEPAM-RS",
-    "iema_es": "IEMA-ES",
-    "ima_al": "IMA-AL",
+    "sigor_sp": "CETESB — São Paulo",
+    "sinir": "IBAMA — Nacional",
+    "inea_rj": "Instituto Estadual do Ambiente — Rio de Janeiro",
+    "semad_go": "Secretaria de Meio Ambiente e Desenvolvimento Sustentável — Goiás",
+    "semad_mg": "Secretaria de Meio Ambiente e Desenvolvimento Sustentável — Minas Gerais",
+    "fepam_rs": "Fundação Estadual de Proteção Ambiental — Rio Grande do Sul",
+    "iema_es": "Instituto Estadual de Meio Ambiente e Recursos Hídricos — Espírito Santo",
+    "ima_al": "Instituto de Meio Ambiente — Alagoas",
 }
 
 SUPPORTED_ISSUERS = {
@@ -67,7 +67,7 @@ SUPPORTED_ISSUERS = {
     "sigor_sp", "sinir", "inea_rj", "semad_go", "semad_mg", "fepam_rs", "iema_es",
 }
 NOT_SUPPORTED_ISSUERS = {
-    "ima_al": "IMA-AL requer CPF para lookup de unidades — consulta só por CNPJ não suportada.",
+    "ima_al": "Instituto de Meio Ambiente de Alagoas requer CPF para lookup de unidades — consulta só por CNPJ não suportada.",
 }
 
 SIGOR_ORIGEM_LABELS = {
