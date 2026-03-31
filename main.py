@@ -58,8 +58,8 @@ ISSUER_LABELS = {
     "rntrc": "RNTRC (ANTT)",
     "cetesb_lo": "CETESB — Licença de Operação / Dispensa (e-CETESB)",
     "spregula": "SP Regula — Operadores Municipais (Prefeitura SP)",
-    "sigor_sp": "CETESB — São Paulo",
-    "sinir": "IBAMA — Nacional",
+    "sigor_sp": "(SIGOR) CETESB — São Paulo",
+    "sinir": "(SINIR) IBAMA — Nacional",
     "inea_rj": "Instituto Estadual do Ambiente — Rio de Janeiro",
     "semad_go": "Secretaria de Meio Ambiente e Desenvolvimento Sustentável — Goiás",
     "semad_mg": "Secretaria de Meio Ambiente e Desenvolvimento Sustentável — Minas Gerais",
@@ -1003,24 +1003,38 @@ def _format_spregula_line(result: dict) -> str:
 
 
 def _build_slack_block(document: str, entity_types: list[str], results: dict) -> list[dict]:
-    """Monta os blocos Slack para um CNPJ."""
+    """
+    Monta os blocos Slack para um CNPJ em duas seções:
+    1. Consulta de documentos  — Cartão CNPJ, RNTRC, CETESB LO
+    2. Cadastro em órgãos emissores — SP Regula, SIGOR, SINIR, portais estaduais
+    IMA-AL não exibido (não suporta consulta por CNPJ).
+    """
     tipo_label = " + ".join(ENTITY_TYPE_LABELS.get(t, t) for t in entity_types)
     cnpj_fmt = fmt_cnpj(document)
 
-    lines = [f"*CNPJ: {cnpj_fmt}*  |  Tipo: _{tipo_label}_\n"]
+    # --- Seção 1: Consulta de documentos ---
+    doc_lines = [
+        f"*CNPJ: {cnpj_fmt}*  |  Tipo: _{tipo_label}_\n",
+        "*#Consulta de documentos*",
+        _format_brasilapi_line(results.get("brasilapi_cnpj", {})),
+        _format_rntrc_line(results.get("rntrc", {})),
+        _format_cetesb_lo_line(results.get("cetesb_lo", {})),
+    ]
 
-    for issuer, label in ISSUER_LABELS.items():
+    # --- Seção 2: Cadastro em órgãos emissores ---
+    emissores_issuers = [
+        "spregula", "sigor_sp", "sinir",
+        "inea_rj", "semad_go", "semad_mg", "fepam_rs", "iema_es",
+    ]
+
+    emissor_lines = ["*#Cadastro em órgãos emissores*"]
+    for issuer in emissores_issuers:
+        label = ISSUER_LABELS[issuer]
         result = results.get(issuer, {})
         registered = result.get("registered")
 
-        if issuer == "brasilapi_cnpj":
-            lines.append(_format_brasilapi_line(result))
-        elif issuer == "rntrc":
-            lines.append(_format_rntrc_line(result))
-        elif issuer == "cetesb_lo":
-            lines.append(_format_cetesb_lo_line(result))
-        elif issuer == "spregula":
-            lines.append(_format_spregula_line(result))
+        if issuer == "spregula":
+            emissor_lines.append(_format_spregula_line(result))
         else:
             icon = ISSUER_ICONS.get(registered, "⚠️")
             if registered is True:
@@ -1028,15 +1042,23 @@ def _build_slack_block(document: str, entity_types: list[str], results: dict) ->
                 if units:
                     first = _format_unit(units[0])
                     extra = f"  (+{len(units)-1} unidades)" if len(units) > 1 else ""
-                    lines.append(f"{icon} *{label}* — {first}{extra}")
+                    emissor_lines.append(f"{icon} *{label}* — {first}{extra}")
                 else:
-                    lines.append(f"{icon} *{label}* — cadastro encontrado")
+                    emissor_lines.append(f"{icon} *{label}* — cadastro encontrado")
             elif registered is False:
-                lines.append(f"{icon} *{label}* — não encontrado")
+                emissor_lines.append(f"{icon} *{label}* — não encontrado")
             else:
-                lines.append(f"{icon} *{label}* — {result.get('message', 'não suportado')}")
+                emissor_lines.append(f"{icon} *{label}* — {result.get('message', 'erro na consulta')}")
 
-    return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}]
+    section1_text = "\n".join(doc_lines)
+    divider = "---------"
+    section2_text = "\n".join(emissor_lines)
+
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": section1_text}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": divider}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": section2_text}},
+    ]
 
 
 @slack_app.event("app_mention")
