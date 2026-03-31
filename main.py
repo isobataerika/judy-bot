@@ -505,6 +505,14 @@ def handle_mention(event, say, logger):
 
 @app.post("/slack/events")
 async def slack_events(req: Request):
+    # Responde ao challenge de verificação do Slack imediatamente,
+    # antes de passar pelo Bolt handler (evita timeout por cold start)
+    try:
+        body = await req.json()
+        if body.get("type") == "url_verification":
+            return {"challenge": body["challenge"]}
+    except Exception:
+        pass
     return await slack_handler.handle(req)
 
 
