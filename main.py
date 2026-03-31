@@ -4,6 +4,7 @@ Verifica cadastro ativo de transportadores e receptores nos portais regulatório
 Bot @judy responde no Slack com resultados por órgão emissor.
 """
 
+import json
 import os
 import re
 import asyncio
@@ -34,7 +35,7 @@ slack_handler = AsyncSlackRequestHandler(slack_app)
 
 app = FastAPI(
     title="Traceability Agent — Operator Lookup",
-    version="1.1.0",
+    version="1.2.0",
     description="Lookup de cadastro ativo de operadores nos portais MTR + Judy Slack Bot.",
 )
 
@@ -49,6 +50,8 @@ ENTITY_TYPE_CODE = {
 }
 
 ISSUER_LABELS = {
+    "brasilapi_cnpj": "Cartão CNPJ (Receita Federal)",
+    "rntrc": "RNTRC (ANTT)",
     "sigor_sp": "SIGOR-SP (CETESB)",
     "sinir": "SINIR (IBAMA Federal)",
     "inea_rj": "INEA-RJ",
@@ -59,7 +62,10 @@ ISSUER_LABELS = {
     "ima_al": "IMA-AL",
 }
 
-SUPPORTED_ISSUERS = {"sigor_sp", "sinir", "inea_rj", "semad_go", "semad_mg", "fepam_rs", "iema_es"}
+SUPPORTED_ISSUERS = {
+    "brasilapi_cnpj", "rntrc",
+    "sigor_sp", "sinir", "inea_rj", "semad_go", "semad_mg", "fepam_rs", "iema_es",
+}
 NOT_SUPPORTED_ISSUERS = {
     "ima_al": "IMA-AL requer CPF para lookup de unidades — consulta só por CNPJ não suportada.",
 }
@@ -75,6 +81,35 @@ SIGOR_ORIGEM_LABELS = {
 HTTPX_TIMEOUT = 20.0
 
 CNPJ_REGEX = re.compile(r"\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}")
+
+# ---------------------------------------------------------------------------
+# RNTRC — resource_id cache (CKAN dataset)
+# ---------------------------------------------------------------------------
+
+_rntrc_resource_id: str | None = None
+
+RNTRC_PACKAGE_URL = "https://dados.antt.gov.br/api/3/action/package_show?id=rntrc"
+RNTRC_DATASTORE_URL = "https://dados.antt.gov.br/api/3/action/datastore_search"
+
+
+async def _get_rntrc_resource_id(client: httpx.AsyncClient) -> str | None:
+    """Obtém o resource_id do arquivo CSV mais recente do dataset RNTRC via CKAN API."""
+    global _rntrc_resource_id
+    if _rntrc_resource_id:
+        return _rntrc_resource_id
+    try:
+        resp = await client.get(RNTRC_PACKAGE_URL, timeout=15.0)
+        data = resp.json()
+        resources = data.get("result", {}).get("resources", [])
+        csv_resources = [r for r in resources if r.get("format", "").upper() == "CSV"]
+        if not csv_resources:
+            return None
+        latest = sorted(csv_resources, key=lambda r: r.get("last_modified", ""), reverse=True)[0]
+        _rntrc_resource_id = latest["id"]
+        return _rntrc_resource_id
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Helpers — formatação de documentos
@@ -140,6 +175,137 @@ class MultiLookupRequest(BaseModel):
         if not v:
             raise ValueError("issuers não pode ser vazio.")
         return v
+
+
+# ---------------------------------------------------------------------------
+# Lookup — Cartão CNPJ via BrasilAPI (Receita Federal)
+# ---------------------------------------------------------------------------
+# Endpoint público: GET https://brasilapi.com.br/api/cnpj/v1/{cnpj}
+# Sem autenticação, sem captcha.
+# ---------------------------------------------------------------------------
+
+async def lookup_brasilapi_cnpj(document: str, entity_type: str) -> dict:
+    url = f"https://brasilapi.com.br/api/cnpj/v1/{document}"
+
+    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
+        try:
+            resp = await client.get(url, headers={"User-Agent": "judy-bot/1.2"})
+        except httpx.TimeoutException:
+            return _error("TIMEOUT", "BrasilAPI não respondeu em 20 segundos.")
+        except httpx.RequestError as exc:
+            return _error("CONNECTION_ERROR", f"Erro de conexão com BrasilAPI: {exc}")
+
+        if resp.status_code == 404:
+            return _not_found("CNPJ não encontrado na Receita Federal.")
+        if resp.status_code != 200:
+            return _error(f"HTTP_{resp.status_code}", f"BrasilAPI retornou HTTP {resp.status_code}.")
+
+        try:
+            data = resp.json()
+        except Exception:
+            return _error("PARSE_ERROR", "Resposta da BrasilAPI não é JSON válido.")
+
+        situacao = data.get("descricao_situacao_cadastral") or data.get("situacao_cadastral") or ""
+        is_active = situacao.strip().upper() == "ATIVA"
+
+        cnae_cod = data.get("cnae_fiscal", "")
+        cnae_desc = data.get("cnae_fiscal_descricao", "")
+        cnae = f"{cnae_cod} — {cnae_desc}".strip(" —") if cnae_cod or cnae_desc else ""
+
+        unit = {
+            "unit_id": document,
+            "name": data.get("razao_social", ""),
+            "fantasy_name": data.get("nome_fantasia") or "",
+            "status": situacao,
+            "cnae": cnae,
+            "porte": data.get("porte") or "",
+            "municipio": data.get("municipio") or "",
+            "uf": data.get("uf") or "",
+            "capital_social": data.get("capital_social"),
+        }
+
+        if is_active:
+            return _found([unit])
+        else:
+            return {
+                "registered": False,
+                "units": [unit],
+                "code": "INACTIVE",
+                "message": f"Situação cadastral: {situacao or 'desconhecida'}",
+            }
+
+
+# ---------------------------------------------------------------------------
+# Lookup — RNTRC via CKAN Datastore (dados.antt.gov.br)
+# ---------------------------------------------------------------------------
+# Query em tempo real pelo CNPJ no dataset aberto da ANTT.
+# Atualizado mensalmente pela ANTT.
+# ---------------------------------------------------------------------------
+
+async def lookup_rntrc(document: str, entity_type: str) -> dict:
+    cnpj_fmt = fmt_cnpj(document)
+
+    async with httpx.AsyncClient(verify=False, timeout=HTTPX_TIMEOUT) as client:
+        resource_id = await _get_rntrc_resource_id(client)
+        if not resource_id:
+            return _error("CONFIG_ERROR", "Não foi possível localizar o dataset RNTRC no portal da ANTT.")
+
+        try:
+            resp = await client.get(
+                RNTRC_DATASTORE_URL,
+                params={
+                    "resource_id": resource_id,
+                    "filters": json.dumps({"cpfcnpjtransportador": cnpj_fmt}),
+                    "limit": 20,
+                },
+            )
+        except httpx.TimeoutException:
+            return _error("TIMEOUT", "ANTT dados abertos não respondeu em 20 segundos.")
+        except httpx.RequestError as exc:
+            return _error("CONNECTION_ERROR", f"Erro de conexão com ANTT dados abertos: {exc}")
+
+        if resp.status_code != 200:
+            return _error(f"HTTP_{resp.status_code}", f"ANTT dados abertos retornou HTTP {resp.status_code}.")
+
+        try:
+            data = resp.json()
+        except Exception:
+            return _error("PARSE_ERROR", "Resposta do ANTT dados abertos não é JSON válido.")
+
+        if not data.get("success"):
+            return _error("API_ERROR", "CKAN datastore retornou erro — dataset pode não estar indexado.")
+
+        records = data.get("result", {}).get("records") or []
+        if not records:
+            return _not_found("CNPJ não encontrado no RNTRC.")
+
+        units = []
+        has_active = False
+        for r in records:
+            situacao = (r.get("situacao_rntrc") or "").strip().upper()
+            if situacao == "ATIVO":
+                has_active = True
+            units.append({
+                "unit_id": r.get("numero_rntrc", ""),
+                "name": r.get("nome_transportador", ""),
+                "status": situacao,
+                "category": r.get("categoria_transportador", ""),
+                "municipio": r.get("municipio", ""),
+                "uf": r.get("uf", ""),
+                "data_cadastro": r.get("data_primeiro_cadastro", ""),
+                "data_situacao": r.get("data_situacao_rntrc", ""),
+            })
+
+        if has_active:
+            return _found(units)
+        else:
+            first_status = units[0].get("status", "INATIVO") if units else "INATIVO"
+            return {
+                "registered": False,
+                "units": units,
+                "code": "INACTIVE",
+                "message": f"CNPJ encontrado no RNTRC mas com situação: {first_status}",
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +515,10 @@ def _error(code: str, message: str) -> dict:
 async def run_lookup(issuer: str, document: str, entity_type: str) -> dict:
     if issuer in NOT_SUPPORTED_ISSUERS:
         return lookup_not_supported(issuer)
+    if issuer == "brasilapi_cnpj":
+        return await lookup_brasilapi_cnpj(document, entity_type)
+    if issuer == "rntrc":
+        return await lookup_rntrc(document, entity_type)
     if issuer == "sigor_sp":
         return await lookup_sigor_sp(document, entity_type)
     if issuer == "sinir":
@@ -361,20 +531,29 @@ async def run_lookup(issuer: str, document: str, entity_type: str) -> dict:
 async def run_lookup_all_issuers(document: str, entity_types: list[str]) -> dict:
     """
     Consulta todos os portais suportados para os entity_types informados.
-    Se entity_types tiver mais de um, mescla os resultados por portal
-    (registered=True prevalece sobre False).
+    BrasilAPI e RNTRC são consultados uma única vez (independente de entity_type).
+    Para os portais MTR, mescla os resultados (registered=True prevalece).
     """
     all_issuers = list(ISSUER_LABELS.keys())
+
+    # Portais independentes de entity_type (consulta uma única vez)
+    entity_independent = {"brasilapi_cnpj", "rntrc"}
 
     async def lookup_for_type(issuer: str, entity_type: str) -> tuple[str, str, dict]:
         result = await run_lookup(issuer, document, entity_type)
         return issuer, entity_type, result
 
-    tasks = [
-        lookup_for_type(issuer, entity_type)
-        for issuer in all_issuers
-        for entity_type in entity_types
-    ]
+    tasks = []
+    seen_independent = set()
+    for issuer in all_issuers:
+        if issuer in entity_independent:
+            if issuer not in seen_independent:
+                seen_independent.add(issuer)
+                tasks.append(lookup_for_type(issuer, entity_types[0]))
+        else:
+            for entity_type in entity_types:
+                tasks.append(lookup_for_type(issuer, entity_type))
+
     raw = await asyncio.gather(*tasks)
 
     # Mescla por portal: registered=True vence
@@ -427,6 +606,80 @@ def _format_unit(unit: dict) -> str:
     return " | ".join(p for p in parts if p)
 
 
+def _format_brasilapi_line(result: dict) -> str:
+    """Formata linha(s) do Cartão CNPJ com mais detalhes."""
+    registered = result.get("registered")
+    icon = ISSUER_ICONS.get(registered, "⚠️")
+    label = ISSUER_LABELS["brasilapi_cnpj"]
+    units = result.get("units") or []
+
+    if registered is None:
+        return f"{icon} *{label}* — {result.get('message', 'erro na consulta')}"
+
+    if not units:
+        return f"{icon} *{label}* — {result.get('message', 'não encontrado')}"
+
+    u = units[0]
+    situacao = u.get("status", "")
+    name = u.get("name", "")
+    fantasy = u.get("fantasy_name", "")
+    cnae = u.get("cnae", "")
+    porte = u.get("porte", "")
+    municipio = u.get("municipio", "")
+    uf = u.get("uf", "")
+
+    display_name = f"{name} ({fantasy})" if fantasy and fantasy.upper() != name.upper() else name
+    loc = f"{municipio}/{uf}" if municipio and uf else municipio or uf
+    details = " | ".join(p for p in [loc, porte] if p)
+
+    lines = [f"{icon} *{label}* — {situacao}"]
+    if display_name:
+        lines.append(f"   {display_name}")
+    if cnae:
+        lines.append(f"   CNAE: {cnae}")
+    if details:
+        lines.append(f"   {details}")
+    return "\n".join(lines)
+
+
+def _format_rntrc_line(result: dict) -> str:
+    """Formata linha do RNTRC com status e número de registro."""
+    registered = result.get("registered")
+    icon = ISSUER_ICONS.get(registered, "⚠️")
+    label = ISSUER_LABELS["rntrc"]
+    units = result.get("units") or []
+
+    if registered is None:
+        return f"{icon} *{label}* — {result.get('message', 'erro na consulta')}"
+
+    if not units:
+        return f"{icon} *{label}* — não registrado"
+
+    u = units[0]
+    name = u.get("name", "")
+    numero = u.get("unit_id", "")
+    categoria = u.get("category", "")
+    municipio = u.get("municipio", "")
+    uf = u.get("uf", "")
+    situacao = u.get("status", "")
+    data_cadastro = u.get("data_cadastro", "")
+
+    loc = f"{municipio}/{uf}" if municipio and uf else municipio or uf
+    rntrc_info = f"RNTRC nº {numero}" if numero else ""
+    details = " | ".join(p for p in [rntrc_info, categoria, loc] if p)
+
+    lines = [f"{icon} *{label}* — {situacao}"]
+    if name:
+        lines.append(f"   {name}")
+    if details:
+        lines.append(f"   {details}")
+    if data_cadastro:
+        lines.append(f"   Cadastro: {data_cadastro}")
+    if len(units) > 1:
+        lines.append(f"   (+{len(units)-1} registros adicionais)")
+    return "\n".join(lines)
+
+
 def _build_slack_block(document: str, entity_types: list[str], results: dict) -> list[dict]:
     """Monta os blocos Slack para um CNPJ."""
     tipo_label = " + ".join(ENTITY_TYPE_LABELS.get(t, t) for t in entity_types)
@@ -437,20 +690,25 @@ def _build_slack_block(document: str, entity_types: list[str], results: dict) ->
     for issuer, label in ISSUER_LABELS.items():
         result = results.get(issuer, {})
         registered = result.get("registered")
-        icon = ISSUER_ICONS.get(registered, "⚠️")
 
-        if registered is True:
-            units = result.get("units") or []
-            if units:
-                first = _format_unit(units[0])
-                extra = f"  (+{len(units)-1} unidades)" if len(units) > 1 else ""
-                lines.append(f"{icon} *{label}* — {first}{extra}")
-            else:
-                lines.append(f"{icon} *{label}* — cadastro encontrado")
-        elif registered is False:
-            lines.append(f"{icon} *{label}* — não encontrado")
+        if issuer == "brasilapi_cnpj":
+            lines.append(_format_brasilapi_line(result))
+        elif issuer == "rntrc":
+            lines.append(_format_rntrc_line(result))
         else:
-            lines.append(f"{icon} *{label}* — {result.get('message', 'não suportado')}")
+            icon = ISSUER_ICONS.get(registered, "⚠️")
+            if registered is True:
+                units = result.get("units") or []
+                if units:
+                    first = _format_unit(units[0])
+                    extra = f"  (+{len(units)-1} unidades)" if len(units) > 1 else ""
+                    lines.append(f"{icon} *{label}* — {first}{extra}")
+                else:
+                    lines.append(f"{icon} *{label}* — cadastro encontrado")
+            elif registered is False:
+                lines.append(f"{icon} *{label}* — não encontrado")
+            else:
+                lines.append(f"{icon} *{label}* — {result.get('message', 'não suportado')}")
 
     return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}]
 
@@ -553,4 +811,4 @@ async def lookup_operator_multi(req: MultiLookupRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.1.0"}
+    return {"status": "ok", "version": "1.2.0"}
