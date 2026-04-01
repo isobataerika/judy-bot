@@ -56,6 +56,7 @@ ENTITY_TYPE_CODE = {
 ISSUER_LABELS = {
     "brasilapi_cnpj": "Cartão CNPJ (Receita Federal)",
     "rntrc": "RNTRC (ANTT)",
+    "ctf_ibama": "CTF/APP IBAMA — Certificado de Regularidade",
     "cetesb_lo": "CETESB — Licença de Operação / Dispensa (e-CETESB)",
     "spregula": "SP Regula — Operadores Municipais (Prefeitura SP)",
     "sigor_sp": "(SIGOR) CETESB — São Paulo",
@@ -69,7 +70,7 @@ ISSUER_LABELS = {
 }
 
 SUPPORTED_ISSUERS = {
-    "brasilapi_cnpj", "rntrc", "cetesb_lo", "spregula",
+    "brasilapi_cnpj", "rntrc", "ctf_ibama", "cetesb_lo", "spregula",
     "sigor_sp", "sinir", "inea_rj", "semad_go", "semad_mg", "fepam_rs", "iema_es",
 }
 NOT_SUPPORTED_ISSUERS = {
@@ -495,6 +496,88 @@ def _parse_servlet_units(items: list) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Lookup — CTF IBAMA (Cadastro Técnico Federal / Certificado de Regularidade)
+# ---------------------------------------------------------------------------
+# Endpoint: POST https://servicos.ibama.gov.br/ctf/publico/certificado_regularidade_consulta.php
+# O reCAPTCHA é validado apenas no frontend (JS) — o backend PHP não exige o token.
+# Resposta em HTML; extraímos os campos via regex nos value= dos inputs.
+# ---------------------------------------------------------------------------
+
+CTF_IBAMA_URL = "https://servicos.ibama.gov.br/ctf/publico/certificado_regularidade_consulta.php"
+
+_CTF_FIELD_RE = re.compile(r'id="([^"]+)"\s+name="\1"\s+value="([^"]*)"')
+_CTF_AVISO_RE = re.compile(r'id="campo_aviso"[^>]*>(.*?)</span>', re.DOTALL)
+
+
+async def lookup_ctf_ibama(document: str, entity_type: str) -> dict:
+    async with httpx.AsyncClient(verify=False, timeout=HTTPX_TIMEOUT) as client:
+        try:
+            resp = await client.post(
+                CTF_IBAMA_URL,
+                data={
+                    "num_cpf_cnpj": document,
+                    "formDinAcao": "Consultar",
+                    "formDinPosVScroll": "",
+                    "formDinPosHScroll": "",
+                    "num_pessoa": "",
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0",
+                },
+            )
+        except httpx.TimeoutException:
+            return _error("TIMEOUT", "CTF IBAMA não respondeu em 20 segundos.")
+        except httpx.RequestError as exc:
+            return _error("CONNECTION_ERROR", f"Erro de conexão com CTF IBAMA: {exc}")
+
+        if resp.status_code != 200:
+            return _error(f"HTTP_{resp.status_code}", f"CTF IBAMA retornou HTTP {resp.status_code}.")
+
+        html = resp.text
+
+        # Extrai campos dos inputs readonly (encoding Latin-1 do portal → decode automático httpx)
+        fields: dict[str, str] = {}
+        for m in _CTF_FIELD_RE.finditer(html):
+            fields[m.group(1)] = m.group(2)
+
+        nome = fields.get("nom_pessoa", "")
+        num_registro = fields.get("num_registro", "")
+        dat_validade = fields.get("dat_validade", "")
+        dat_constituicao = fields.get("dat_constituicao", "")
+
+        # Determina status pela mensagem do campo aviso
+        aviso_match = _CTF_AVISO_RE.search(html)
+        aviso_text = aviso_match.group(1).lower() if aviso_match else html.lower()
+
+        nao_possui = "não possui" in aviso_text or "nao possui" in aviso_text or "n\u00e3o possui" in aviso_text
+        possui = "possui" in aviso_text and not nao_possui
+
+        if not nome and not num_registro:
+            # Sem dados — provavelmente CNPJ não encontrado
+            if nao_possui or not possui:
+                return _not_found("CNPJ não possui Certificado de Regularidade no CTF/APP IBAMA.")
+            return _not_found("CNPJ não encontrado no CTF/APP IBAMA.")
+
+        unit = {
+            "unit_id": num_registro,
+            "name": nome,
+            "status": "Regular" if possui else "Irregular",
+            "dat_validade": dat_validade,
+            "dat_constituicao": dat_constituicao,
+        }
+
+        if possui:
+            return _found([unit])
+        return {
+            "registered": False,
+            "units": [unit],
+            "code": "INACTIVE",
+            "message": "Empresa encontrada no CTF IBAMA mas sem Certificado de Regularidade ativo.",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Lookup — CETESB Licença de Operação / Dispensa (e-CETESB)
 # ---------------------------------------------------------------------------
 # Endpoint público: GET https://e.cetesb.sp.gov.br/portal-servicos-backend/v1/public/requisitions/
@@ -783,6 +866,8 @@ async def run_lookup(issuer: str, document: str, entity_type: str) -> dict:
         return await lookup_brasilapi_cnpj(document, entity_type)
     if issuer == "rntrc":
         return await lookup_rntrc(document, entity_type)
+    if issuer == "ctf_ibama":
+        return await lookup_ctf_ibama(document, entity_type)
     if issuer == "cetesb_lo":
         return await lookup_cetesb_lo(document, entity_type)
     if issuer == "spregula":
@@ -805,7 +890,7 @@ async def run_lookup_all_issuers(document: str, entity_types: list[str]) -> dict
     all_issuers = list(ISSUER_LABELS.keys())
 
     # Portais independentes de entity_type (consulta uma única vez)
-    entity_independent = {"brasilapi_cnpj", "rntrc", "cetesb_lo", "spregula"}
+    entity_independent = {"brasilapi_cnpj", "rntrc", "ctf_ibama", "cetesb_lo", "spregula"}
 
     async def lookup_for_type(issuer: str, entity_type: str) -> tuple[str, str, dict]:
         result = await run_lookup(issuer, document, entity_type)
@@ -948,6 +1033,33 @@ def _format_rntrc_line(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_ctf_ibama_line(result: dict) -> str:
+    """Formata resultado do CTF IBAMA com número de registro e validade do CR."""
+    registered = result.get("registered")
+    icon = ISSUER_ICONS.get(registered, "⚠️")
+    label = ISSUER_LABELS["ctf_ibama"]
+    units = result.get("units") or []
+
+    if registered is None:
+        return f"{icon} *{label}* — {result.get('message', 'erro na consulta')}"
+    if not units:
+        return f"{icon} *{label}* — {result.get('message', 'não encontrado')}"
+
+    u = units[0]
+    status = u.get("status", "")
+    num = u.get("unit_id", "")
+    validade = u.get("dat_validade", "")
+    name = u.get("name", "")
+
+    lines = [f"{icon} *{label}* — {status}"]
+    if name:
+        lines.append(f"   {name}")
+    detail = " | ".join(p for p in [f"Registro nº {num}" if num else "", f"CR válido até: {validade}" if validade else ""] if p)
+    if detail:
+        lines.append(f"   {detail}")
+    return "\n".join(lines)
+
+
 def _format_cetesb_lo_line(result: dict) -> str:
     """Formata resultado do e-CETESB com tipo de processo e status."""
     registered = result.get("registered")
@@ -1023,6 +1135,7 @@ def _build_slack_block(document: str, entity_types: list[str], results: dict) ->
         "*#Consulta de documentos*",
         _format_brasilapi_line(results.get("brasilapi_cnpj", {})),
         _format_rntrc_line(results.get("rntrc", {})),
+        _format_ctf_ibama_line(results.get("ctf_ibama", {})),
         _format_cetesb_lo_line(results.get("cetesb_lo", {})),
     ]
 
